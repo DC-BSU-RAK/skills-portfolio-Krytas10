@@ -20,7 +20,7 @@ class MathQuizGUI:
 
         self.displayMenu()
 
-    # DISPLAY MENU
+    # Display
     def displayMenu(self):
         """Shows difficulty selection menu."""
         self.clearWindow()
@@ -34,7 +34,7 @@ class MathQuizGUI:
         tk.Button(self.root, text="3. Advanced (4-digit numbers)", width=30,
                   command=lambda: self.startQuiz(3)).pack(pady=8)
 
-    # START QUIZ
+    # Start Quiz
     def startQuiz(self, level):
         """Starts the quiz with selected difficulty."""
         self.difficulty = level
@@ -43,7 +43,7 @@ class MathQuizGUI:
 
         self.nextQuestion()
 
-    # RANDOM INT
+    # Random Int
     def randomInt(self):
         """Returns random integers based on difficulty."""
         if self.difficulty == 1:
@@ -53,12 +53,12 @@ class MathQuizGUI:
         else:
             return random.randint(1000, 9999)
 
-    # DECIDE OPERATION
+    # Decide Operation
     def decideOperation(self):
         """Randomly returns '+' or '-'."""
         return random.choice(['+', '-'])
 
-    # DISPLAY PROBLEM
+    # Display Operation
     def nextQuestion(self):
         """Moves to next question or final results."""
         if self.question_count == 10:
@@ -96,7 +96,7 @@ class MathQuizGUI:
 
         tk.Button(self.root, text="Submit Answer", command=self.checkAnswer).pack(pady=15)
 
-    # IS CORRECT
+    # Is correct
     def checkAnswer(self):
         """Check user answer."""
         try:
@@ -121,7 +121,7 @@ class MathQuizGUI:
                 messagebox.showinfo("Incorrect", f"Wrong again! Correct answer was {self.correct_answer}")
                 self.nextQuestion()
 
-    # DISPLAY RESULTS
+    # Display results
     def displayResults(self):
         """Show final score and grade."""
         self.clearWindow()
@@ -148,7 +148,7 @@ class MathQuizGUI:
         else:
             return "F"
 
-    # CLEAR WINDOW
+    # Clear Window
     def clearWindow(self):
         for widget in self.root.winfo_children():
             widget.destroy()
