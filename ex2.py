@@ -3,11 +3,11 @@ from tkinter import messagebox
 import random
 import os
 
-# Path to the jokes file (assumes it's in the same directory as this script)
+# path of the joke file in the same directory
 JOKES_FILE = "randomJokes.txt"
 
 def load_jokes():
-    """Load and parse jokes from the file. Each joke: setup?punchline"""
+    """Load and parse jokes from the file."""
     if not os.path.exists(JOKES_FILE):
         messagebox.showerror("Error", f"Could not find {JOKES_FILE}!")
         return []
@@ -19,10 +19,10 @@ def load_jokes():
                 line = line.strip()
                 if not line:
                     continue
-                # Most jokes use '?' to separate setup and punchline
+                # '?' to separate setup and punchline
                 if "?" in line:
                     setup, punchline = line.split("?", 1)
-                    # Clean up any extra spaces
+                    
                     setup = setup.strip() + "?"
                     punchline = punchline.strip()
                     jokes.append((setup, punchline))
@@ -57,7 +57,7 @@ class JokeApp:
         )
         title_label.pack(pady=20)
 
-        # Joke display area (setup)
+        # Joke display 
         self.setup_label = tk.Label(
             root,
             text="Click the button below to hear a joke!",
@@ -69,7 +69,7 @@ class JokeApp:
         )
         self.setup_label.pack(pady=30)
 
-        # Punchline label (initially hidden)
+        # Punchline 
         self.punchline_label = tk.Label(
             root,
             text="",
@@ -158,7 +158,7 @@ class JokeApp:
             self.tell_joke_btn.config(state=tk.NORMAL)
 
 
-# ——————————————— Run the app ———————————————
+# Run the app
 if __name__ == "__main__":
     root = tk.Tk()
     app = JokeApp(root)
