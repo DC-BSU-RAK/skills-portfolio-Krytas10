@@ -7,7 +7,6 @@ import os
 JOKES_FILE = "randomJokes.txt"
 
 def load_jokes():
-    """Load and parse jokes from the file."""
     if not os.path.exists(JOKES_FILE):
         messagebox.showerror("Error", f"Could not find {JOKES_FILE}!")
         return []
@@ -137,7 +136,6 @@ class JokeApp:
         quit_btn.grid(row=1, column=1, pady=10)
 
     def tell_joke(self):
-        """Select and display a new random joke setup"""
         if not self.jokes:
             return
 
@@ -150,7 +148,6 @@ class JokeApp:
         self.tell_joke_btn.config(state=tk.DISABLED)
 
     def show_punchline(self):
-        """Reveal the punchline"""
         if self.current_joke:
             _, punchline = self.current_joke
             self.punchline_label.config(text=punchline)
