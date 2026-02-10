@@ -1,0 +1,992 @@
+"""
+CINEXPLORE – Movie Explorer Application
+---------------------------------------
+A Tkinter-based desktop app that lets users search, browse trending,
+discover random, and filter movies by genre using the TMDB API.
+
+Architecture
+------------
+- TMDBClient   : Handles every HTTP call to the TMDB REST API.
+- ImageLoader  : Downloads and resizes poster / backdrop images.
+- Page (ABC)   : Abstract base for every screen in the app.
+- IntroPage    : The first splash screen with a "Start" button.
+- InstructionsPage : Step-by-step guide shown before the main menu.
+- HomePage     : The main menu with four navigation buttons.
+- SearchPage   : Search bar + live movie details & poster.
+- TrendingPage : Carousel of this week's trending movies.
+- RandomPage   : Three randomly-picked movie posters with refresh.
+- GenrePage    : Genre selector + a 2×3 grid of genre-filtered posters.
+- CinexploreApp: Root application creates the window, wires pages,
+                 and owns the single Tk root so every page can share it.
+
+Note on API Key
+---------------
+The TMDB API key below is hard-coded for convenience.  In production
+you would load it from an environment variable or a config file, e.g.:
+    TMDB_API_KEY = os.environ["TMDB_API_KEY"]
+This is flagged intentionally so it can be mentioned in any reflection.
+"""
+
+import tkinter as tk
+from tkinter import messagebox          # ← messagebox used for user alerts
+from abc import ABC, abstractmethod     # ← ABC makes the Page base-class abstract
+from PIL import Image, ImageTk
+import requests
+from io import BytesIO
+import random
+import os                               # kept for future env-var loading
+
+
+
+# 1. CONFIGURATION
+
+TMDB_API_KEY: str = "9417568c21addb912ad1cd7fd441daa7"
+
+SEARCH_URL:    str = "https://api.themoviedb.org/3/search/movie"
+TRENDING_URL:  str = "https://api.themoviedb.org/3/trending/movie/week"
+DISCOVER_URL:  str = "https://api.themoviedb.org/3/discover/movie"
+GENRE_LIST_URL:str = "https://api.themoviedb.org/3/genre/movie/list"
+IMG_BASE:      str = "https://image.tmdb.org/t/p/w500"
+BACKDROP_BASE: str = "https://image.tmdb.org/t/p/w1280"
+
+# Local image files used as page backgrounds
+HOMEPAGE_IMG:  str = "homepage.png"
+SEARCH_IMG:    str = "search.png"
+
+# Window dimensions (kept fixed as in the original)
+WIN_WIDTH:  int = 900
+WIN_HEIGHT: int = 605
+CANVAS_W:   int = 1078
+CANVAS_H:   int = 605
+
+# Genre name → TMDB genre-ID mapping
+GENRE_TO_ID: dict[str, int] = {
+    "Action": 28, "Mystery": 53, "Drama": 18, "Horror": 27,
+    "Sci-Fi": 878, "Thriller": 80, "Romance": 10749, "Adventure": 12
+}
+
+
+# 2.  UTILITY CLASSES
+
+class TMDBClient:
+    """
+    Thin wrapper around the TMDB v3 REST API.
+
+    Every public method returns a plain Python dict (the parsed JSON body)
+    or raises an exception on network / HTTP errors.  Keeping HTTP logic
+    here means the rest of the code never calls `requests` directly.
+    """
+
+    
+    # Internal helper
+
+    @staticmethod
+    def _get(url: str, params: dict, timeout: int = 8) -> dict:
+        """Send a GET request, raise on bad status, return JSON body."""
+        resp = requests.get(url, params=params, timeout=timeout)
+        resp.raise_for_status()          # raises HTTPError for 4xx/5xx
+        return resp.json()
+
+    # Public API methods
+
+    @staticmethod
+    def search_movies(query: str, page: int = 1) -> dict:
+        """Search for movies matching *query*.  Returns the full TMDB response."""
+        return TMDBClient._get(SEARCH_URL, {
+            "api_key":  TMDB_API_KEY,
+            "query":    query,
+            "language": "en-US",
+            "page":     page
+        })
+
+    @staticmethod
+    def get_genres() -> dict[int, str]:
+        """Return a dict mapping genre-ID → genre-name."""
+        data = TMDBClient._get(GENRE_LIST_URL, {
+            "api_key":  TMDB_API_KEY,
+            "language": "en-US"
+        })
+        return {g["id"]: g["name"] for g in data.get("genres", [])}
+
+    @staticmethod
+    def get_trending(time_window: str = "week") -> list[dict]:
+        """Return up to 10 trending movies for the given time window."""
+        data = TMDBClient._get(TRENDING_URL.replace("week", time_window), {
+            "api_key": TMDB_API_KEY
+        })
+        return data.get("results", [])[:10]
+
+    @staticmethod
+    def discover(genre_id: int | None = None, page: int | None = None) -> list[dict]:
+        """
+        Discover movies, optionally filtered by *genre_id*.
+        If *page* is None a random page (1-50) is chosen automatically.
+        """
+        params: dict = {
+            "api_key":        TMDB_API_KEY,
+            "language":       "en-US",
+            "sort_by":        "popularity.desc",
+            "include_adult":  "false",
+            "page":           page if page else random.randint(1, 50)
+        }
+        if genre_id is not None:
+            params["with_genres"] = genre_id
+        data = TMDBClient._get(DISCOVER_URL, params)
+        return data.get("results", [])
+
+
+class ImageLoader:
+    """
+    Downloads images from a URL and converts them into Tkinter PhotoImages.
+
+    All methods are @staticmethod so the class acts as a pure utility –
+    no state is stored internally.
+    """
+
+    @staticmethod
+    def load_poster(poster_path: str, size: tuple[int, int] = (200, 300)) -> ImageTk.PhotoImage | None:
+        """
+        Download a TMDB poster and return a PhotoImage resized to *size*.
+        Returns None if the download or conversion fails for any reason.
+        """
+        url = IMG_BASE + poster_path
+        try:
+            resp = requests.get(url, timeout=6)
+            if resp.status_code == 200:
+                img = Image.open(BytesIO(resp.content))
+                img = img.resize(size, Image.Resampling.LANCZOS)
+                return ImageTk.PhotoImage(img)
+        except Exception:
+            pass                         # caller decides how to handle None
+        return None
+
+    @staticmethod
+    def load_backdrop(backdrop_path: str, size: tuple[int, int] = (600, 338)) -> ImageTk.PhotoImage | None:
+        """Download a TMDB backdrop and return a PhotoImage resized to *size*."""
+        url = BACKDROP_BASE + backdrop_path
+        try:
+            resp = requests.get(url, timeout=6)
+            if resp.status_code == 200:
+                img = Image.open(BytesIO(resp.content))
+                img = img.resize(size, Image.Resampling.LANCZOS)
+                return ImageTk.PhotoImage(img)
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def load_local(path: str, size: tuple[int, int]) -> ImageTk.PhotoImage | None:
+        """Open a local image file, resize, and return as PhotoImage."""
+        try:
+            img = Image.open(path).resize(size, Image.Resampling.LANCZOS)
+            return ImageTk.PhotoImage(img)
+        except FileNotFoundError:
+            return None
+
+    @staticmethod
+    def load_icon_from_url(url: str, size: tuple[int, int] = (20, 20)) -> ImageTk.PhotoImage | None:
+        """Fetch a small icon image from a remote URL."""
+        try:
+            resp = requests.get(url, timeout=5)
+            img = Image.open(BytesIO(resp.content)).resize(size, Image.Resampling.LANCZOS)
+            return ImageTk.PhotoImage(img)
+        except Exception:
+            return None
+
+
+# 3.  SHARED BUTTON / HOVER HELPERS  (kept as free functions)
+
+def _hover_enter(event):
+    """Highlight a button when the mouse enters."""
+    event.widget.config(bg="darkorange", fg="white")
+
+
+def _hover_leave(event):
+    """Reset a button when the mouse leaves."""
+    event.widget.config(bg="white", fg="black")
+
+
+def _make_nav_button(parent, text: str, command, x: int, y: int) -> tk.Button:
+    """
+    Factory that creates a styled navigation button and binds hover effects.
+    Used by HomePage (and could be reused anywhere).
+    """
+    btn = tk.Button(
+        parent, text=text, command=command,
+        bg="white", fg="black", font=("Arial", 12, "bold"),
+        width=14, bd=3, relief="sunken",
+        activebackground="darkorange", activeforeground="white"
+    )
+    btn.bind("<Enter>", _hover_enter)
+    btn.bind("<Leave>", _hover_leave)
+    btn.place(x=x, y=y)
+    return btn
+
+
+
+# 4.  ABSTRACT PAGE BASE CLASS
+
+class Page(ABC):
+    """
+    Every screen in the app inherits from Page.
+
+    Attributes
+    ----------
+    app   : Reference to the root CinexploreApp (gives access to the Tk root
+            and, in the future, shared state).
+    frame : The tk.Frame that holds all widgets for this page.
+    """
+
+    def __init__(self, app: "CinexploreApp"):
+        self.app   = app                 # back-reference to the main app
+        self.frame = tk.Frame(app.root)  # one frame per page
+        self.frame.place(x=0, y=0, relwidth=1, relheight=1)
+        self._build()                    # subclass fills in widgets here
+
+
+    # Abstract / overridable methods
+    
+    @abstractmethod
+    def _build(self):
+        """Construct all widgets for this page (called once in __init__)."""
+        ...
+
+    def on_show(self):
+        """
+        Called every time the page is brought to the front.
+        Override in subclasses that need to refresh data on each visit.
+        """
+        pass
+
+
+    # Convenience
+
+    def show(self):
+        """Bring this page's frame to the top of the stacking order."""
+        self.frame.tkraise()
+        self.on_show()
+
+
+
+# 5.  INTRO PAGE  (splash with "Start" button)
+
+class IntroPage(Page):
+    """First screen the user sees a background image and a Start button."""
+
+    def _build(self):
+        # Try to load the background image; fall back to plain grey
+        self._bg_photo = ImageLoader.load_local(HOMEPAGE_IMG, (CANVAS_W, WIN_HEIGHT))
+        if self._bg_photo:
+            tk.Label(self.frame, image=self._bg_photo).place(
+                x=0, y=0, relwidth=1, relheight=1
+            )
+            # "Start" button – navigates to the instructions page
+            _make_nav_button(self.frame, "Start", self._go_to_instructions, 372, 335)
+        else:
+            self.frame.configure(bg="gray")   # graceful fallback
+
+
+    def _go_to_instructions(self):
+        """Switch to the instructions page."""
+        self.app.pages["instructions"].show()
+
+
+
+# 6.  INSTRUCTIONS PAGE
+
+class InstructionsPage(Page):
+    """Displays usage instructions drawn on a Canvas."""
+
+    # INSTRUCTIONS TEXT
+    _INSTRUCTIONS_TEXT = (
+        "1. Search Movie\n"
+        "          - Type a movie title in the search bar and press Enter\n"
+        "          - Shows title, description, genre, year, rating & poster\n\n"
+
+        "2. Trending Movies\n"
+        "          - Shows the most popular movies of the current week\n\n"
+
+        "3. Random Movies\n"
+        "          - Displays 3 random popular movies\n"
+        "          - Click \"Suggest More\" to get a new set of 3 random suggestions\n\n"
+
+        "4. Genres\n"
+        "          - Click any genre name (Action, Comedy, Drama, etc.)\n"
+        "          - The 6 posters will update to show only movies from that genre\n"
+        "          - Click a different genre to see movies from that category\n\n"
+
+        "Use the ← Back link on each page to return to the main menu.\n"
+        "Enjoy exploring movies!"
+    )
+
+    def _build(self):
+        self.frame.configure(bg="black")
+
+        # Canvas fills the whole frame – used for text drawing
+        self._canvas = tk.Canvas(
+            self.frame, width=CANVAS_W, height=WIN_HEIGHT,
+            highlightthickness=0, bg="black"
+        )
+        self._canvas.place(x=0, y=0)
+
+        # Title
+        self._canvas.create_text(
+            95, 75, text="Instructions",
+            font=("Helvetica", 22, "bold"), fill="red", anchor="nw"
+        )
+
+        # Decorative border rectangle
+        self._canvas.create_rectangle(200, 150, 700, 450, outline="white", width=2)
+
+        # Body text
+        self._canvas.create_text(
+            450, 300, text=self._INSTRUCTIONS_TEXT,
+            font=("Arial", 8), fill="white",
+            anchor="center", width=450, justify="left"
+        )
+
+        # "Next" link clickable text that goes to the home page
+        self._next_id = self._canvas.create_text(
+            430, 500, text="Next",
+            font=("Arial", 12, "bold"), fill="white",
+            anchor="nw", tags="next_link"
+        )
+        self._canvas.tag_bind("next_link", "<Button-1>", lambda e: self.app.pages["home"].show())
+        self._canvas.tag_bind("next_link", "<Enter>",   lambda e: self._canvas.itemconfig("next_link", fill="red"))
+        self._canvas.tag_bind("next_link", "<Leave>",   lambda e: self._canvas.itemconfig("next_link", fill="white"))
+
+
+
+# 7.  HOME PAGE  (main menu)
+
+class HomePage(Page):
+    """Central navigation hub four buttons leading to feature pages."""
+
+    def _build(self):
+        # Background image (same as intro)
+        self._bg_photo = ImageLoader.load_local(HOMEPAGE_IMG, (CANVAS_W, WIN_HEIGHT))
+        if self._bg_photo:
+            tk.Label(self.frame, image=self._bg_photo).place(
+                x=0, y=0, relwidth=1, relheight=1
+            )
+            # Navigation buttons – each calls the relevant page's show()
+            _make_nav_button(self.frame, "Search Movie",    self._show_search,   372, 250)
+            _make_nav_button(self.frame, "Trending Movies", self._show_trending, 372, 300)
+            _make_nav_button(self.frame, "Random Movies",   self._show_random,   372, 350)
+            _make_nav_button(self.frame, "Genres",          self._show_genres,   372, 400)
+        else:
+            self.frame.configure(bg="gray")
+
+
+    # Private navigation helpers
+
+    def _show_search(self):
+        self.app.pages["search"].show()
+
+    def _show_trending(self):
+        self.app.pages["trending"].show()
+
+    def _show_random(self):
+        self.app.pages["random"].show()
+
+    def _show_genres(self):
+        self.app.pages["genres"].show()
+
+
+# 8.  SEARCH PAGE
+
+class SearchPage(Page):
+    """
+    Lets the user type a movie title, then displays title, description,
+    genre, year, rating and poster.  Uses messagebox to alert the user
+    when the search field is empty or no results are found.
+    """
+
+    def _build(self):
+        # background 
+        self._bg_photo = ImageLoader.load_local(SEARCH_IMG, (CANVAS_W, WIN_HEIGHT))
+        if self._bg_photo:
+            self._canvas = tk.Canvas(
+                self.frame, width=CANVAS_W, height=WIN_HEIGHT, highlightthickness=0
+            )
+            self._canvas.place(x=0, y=0)
+            self._canvas.create_image(0, 0, image=self._bg_photo, anchor="nw")
+            self._canvas.create_text(
+                95, 75, text="CINEXPLORE",
+                font=("Helvetica", 16, "bold"), fill="red", anchor="nw"
+            )
+        else:
+            self.frame.configure(bg="#0a0a0a")
+            # Create a plain canvas so the rest of _build still works
+            self._canvas = tk.Canvas(
+                self.frame, width=CANVAS_W, height=WIN_HEIGHT,
+                highlightthickness=0, bg="#0a0a0a"
+            )
+            self._canvas.place(x=0, y=0)
+
+        # search entry + icon 
+        self._search_var = tk.StringVar()
+        self._search_entry = tk.Entry(
+            self.frame, textvariable=self._search_var, font=("Arial", 13),
+            width=20, bd=2, relief="flat", bg="#1e1e1e", fg="white",
+            insertbackground="white"
+        )
+        self._search_entry.place(x=565, y=78)
+        self._search_entry.bind("<Return>", lambda e: self._search_movie())
+
+        # Try to load search icon from the web; fall back to emoji
+        icon_photo = ImageLoader.load_icon_from_url(
+            "https://img.icons8.com/ios-glyphs/30/ffffff/search.png"
+        )
+        if icon_photo:
+            icon_label = tk.Label(
+                self.frame, image=icon_photo, bg="#510000", cursor="hand2"
+            )
+            icon_label.image = icon_photo   # prevent garbage-collection
+            icon_label.place(x=738, y=78)
+        else:
+            icon_label = tk.Label(
+                self.frame, text="🔍", font=("Arial", 20),
+                fg="white", bg="#510000", cursor="hand2"
+            )
+            icon_label.place(x=738, y=74)
+        icon_label.bind("<Button-1>", lambda e: self._search_movie())
+
+        # result text items drawn on the canvas 
+        self._title_id   = self._canvas.create_text(102, 190, text="Movie Title",
+            font=("Helvetica", 15, "bold"), fill="darkorange", anchor="nw", tags="results")
+        self._desc_head  = self._canvas.create_text(102, 250, text="Description:",
+            font=("Arial", 12, "bold"), fill="white", anchor="nw", tags="results")
+        self._desc_body  = self._canvas.create_text(102, 280,
+            text="The movie description will appear here after you search.",
+            font=("Arial", 10), fill="#d0d0d0", anchor="nw",
+            width=420, justify="left", tags="results")
+        self._genre_id   = self._canvas.create_text(102, 360, text="Genre:",
+            font=("Arial", 10), fill="#bbbbbb", anchor="nw", tags="results")
+        self._year_id    = self._canvas.create_text(102, 380, text="Year:",
+            font=("Arial", 10), fill="#bbbbbb", anchor="nw", tags="results")
+        self._rating_id  = self._canvas.create_text(102, 400, text="Rating:",
+            font=("Arial", 10), fill="#bbbbbb", anchor="nw", tags="results")
+
+        # poster placeholder
+        poster_frame = tk.Frame(self.frame, bg="#0a0a0a")
+        poster_frame.place(x=565, y=160, width=200, height=300)
+        self._poster_label = tk.Label(poster_frame, bg="#111111", text="Poster",
+                                      font=("Arial", 14), fg="#555555")
+        self._poster_label.pack(expand=True, fill="both")
+        self._poster_ref = None          # holds PhotoImage to prevent GC
+
+        # back button 
+        self._back_id = self._canvas.create_text(
+            430, 550, text="← Back",
+            font=("Arial", 12, "bold"), fill="white", anchor="nw", tags="back_btn"
+        )
+        self._canvas.tag_bind("back_btn", "<Button-1>", lambda e: self.app.pages["home"].show())
+        self._canvas.tag_bind("back_btn", "<Enter>",   lambda e: self._canvas.itemconfig("back_btn", fill="red"))
+        self._canvas.tag_bind("back_btn", "<Leave>",   lambda e: self._canvas.itemconfig("back_btn", fill="white"))
+
+
+    # Core logic
+
+    def _search_movie(self):
+        """
+        Validate input → call API → populate canvas text + poster.
+        Uses messagebox when the query is empty or returns no results.
+        """
+        query = self._search_var.get().strip()
+
+        # empty-query (messagebox)
+        if not query:
+            messagebox.showwarning(
+                "Search Warning",
+                "Please type a movie title before searching."
+            )
+            return
+
+        try:
+            # Fetch the genre map so we can display genre names
+            genre_map = TMDBClient.get_genres()
+
+            # Run the search
+            data = TMDBClient.search_movies(query)
+            results = data.get("results", [])
+
+            # no-results guard (messagebox)
+            if not results:
+                messagebox.showinfo(
+                    "No Results",
+                    f'No movies matched "{query}".\nTry a different title or spelling.'
+                )
+                # Also clear the on-screen display so it doesn't look stale
+                self._canvas.itemconfig(self._title_id,  text="No results found")
+                self._canvas.itemconfig(self._desc_body, text=f'Nothing matched "{query}"')
+                self._canvas.itemconfig(self._genre_id,  text="Genre: —")
+                self._canvas.itemconfig(self._year_id,   text="Year: —")
+                self._canvas.itemconfig(self._rating_id, text="Rating: —")
+                self._poster_label.config(image="", text="No poster")
+                self._poster_ref = None
+                return
+
+            # populate UI with the first result 
+            movie = results[0]
+            self._canvas.itemconfig(self._title_id,
+                                    text=movie.get("title", "Unknown Title").upper())
+            self._canvas.itemconfig(self._desc_body,
+                                    text=movie.get("overview", "No overview available."))
+
+            # Year – first 4 chars of release_date
+            year   = movie.get("release_date", "—")[:4] or "—"
+            rating = movie.get("vote_average", "—")
+            genres = [genre_map.get(gid, "Unknown") for gid in movie.get("genre_ids", [])]
+
+            self._canvas.itemconfig(self._genre_id,  text=f"Genre: {', '.join(genres) or '—'}")
+            self._canvas.itemconfig(self._year_id,   text=f"Year: {year}")
+            self._canvas.itemconfig(self._rating_id, text=f"Rating: {rating}")
+
+            # poster image
+            poster_path = movie.get("poster_path")
+            if poster_path:
+                photo = ImageLoader.load_poster(poster_path, (300, 450))
+                if photo:
+                    self._poster_label.config(image=photo, text="")
+                    self._poster_ref = photo   # keep alive
+                else:
+                    self._poster_label.config(image="", text="Poster not available")
+                    self._poster_ref = None
+            else:
+                self._poster_label.config(image="", text="No poster available")
+                self._poster_ref = None
+
+        except Exception as exc:
+            # Show the error in a messagebox AND update the canvas
+            messagebox.showerror("Network Error", f"Something went wrong:\n{str(exc)[:150]}")
+            self._canvas.itemconfig(self._title_id,  text="Error")
+            self._canvas.itemconfig(self._desc_body, text=str(exc)[:180])
+            self._canvas.itemconfig(self._genre_id,  text="Genre: ")
+            self._canvas.itemconfig(self._year_id,   text="Year: ")
+            self._canvas.itemconfig(self._rating_id, text="Rating: ")
+            self._poster_label.config(image="", text="Load error")
+            self._poster_ref = None
+
+
+# 9.  TRENDING PAGE  (carousel)
+
+class TrendingPage(Page):
+    """
+    Displays trending movies in a carousel.  Left/right arrow canvas text
+    items navigate between movies; the backdrop image updates accordingly.
+    """
+
+    def __init__(self, app: "CinexploreApp"):
+        # Initialise state BEFORE _build, because _build may reference them
+        self._movies:       list[dict]             = []
+        self._current_idx:  int                    = 0
+        self._backdrop_ref: ImageTk.PhotoImage | None = None
+        super().__init__(app)
+
+
+    def _build(self):
+        # background canvas
+        self._bg_photo = ImageLoader.load_local(SEARCH_IMG, (CANVAS_W, WIN_HEIGHT))
+        if self._bg_photo:
+            self._canvas = tk.Canvas(
+                self.frame, width=CANVAS_W, height=WIN_HEIGHT, highlightthickness=0
+            )
+            self._canvas.place(x=0, y=0)
+            self._canvas.create_image(0, 0, image=self._bg_photo, anchor="nw")
+            self._canvas.create_text(
+                65, 75, text="TRENDING THIS WEEK",
+                font=("Helvetica", 16, "bold"), fill="red", anchor="nw"
+            )
+        else:
+            self.frame.configure(bg="#0a0a0a")
+            self._canvas = tk.Canvas(
+                self.frame, width=CANVAS_W, height=WIN_HEIGHT,
+                highlightthickness=0, bg="#0a0a0a"
+            )
+            self._canvas.place(x=0, y=0)
+
+        # backdrop label (sits on top of canvas) 
+        self._backdrop_label = tk.Label(self.frame, bg="#111111", text="Loading trending movies…")
+        self._backdrop_label.place(x=180, y=140, width=550, height=308)
+
+        # movie title below the backdrop
+        self._title_id = self._canvas.create_text(
+            450, 495, text="", font=("Helvetica", 16, "bold"),
+            fill="white", anchor="center"
+        )
+
+        # navigation arrows 
+        self._left_arrow  = self._canvas.create_text(
+            100, 300, text="❮", font=("Arial", 25, "bold"),
+            fill="white", tags="arrow", anchor="center"
+        )
+        self._right_arrow = self._canvas.create_text(
+            800, 300, text="❯", font=("Arial", 25, "bold"),
+            fill="white", tags="arrow", anchor="center"
+        )
+        # Hover colouring for both arrows at once (they share the "arrow" tag)
+        self._canvas.tag_bind("arrow", "<Enter>", lambda e: self._canvas.itemconfig("arrow", fill="red"))
+        self._canvas.tag_bind("arrow", "<Leave>", lambda e: self._canvas.itemconfig("arrow", fill="white"))
+        # Click bindings – each arrow bound individually
+        self._canvas.tag_bind(self._left_arrow,  "<Button-1>", lambda e: self._navigate(-1))
+        self._canvas.tag_bind(self._right_arrow, "<Button-1>", lambda e: self._navigate(1))
+
+        # back link 
+        self._back_id = self._canvas.create_text(
+            410, 550, text="← Back",
+            font=("Arial", 12, "bold"), fill="white", anchor="nw", tags="back_trend"
+        )
+        self._canvas.tag_bind("back_trend", "<Button-1>", lambda e: self.app.pages["home"].show())
+        self._canvas.tag_bind("back_trend", "<Enter>",   lambda e: self._canvas.itemconfig("back_trend", fill="red"))
+        self._canvas.tag_bind("back_trend", "<Leave>",   lambda e: self._canvas.itemconfig("back_trend", fill="white"))
+
+    # Page-lifecycle hook  (fetch data on every visit)
+
+    def on_show(self):
+        """Reload trending movies each time the page is displayed."""
+        if not self._movies:
+            self._load_trending()
+
+
+    # Data loading
+
+    def _load_trending(self):
+        """Fetch trending movies from TMDB; show a messagebox on failure."""
+        try:
+            self._movies    = TMDBClient.get_trending()
+            self._current_idx = 0
+            self._show_current()
+        except Exception as exc:
+            messagebox.showerror(
+                "Network Error",
+                f"Could not load trending movies:\n{str(exc)[:120]}"
+            )
+            self._backdrop_label.config(text=f"Error: {str(exc)[:60]}")
+
+    # Display helpers
+
+    def _show_current(self):
+        """Render the movie at _current_idx onto the backdrop & title."""
+        if not self._movies:
+            self._backdrop_label.config(text="No trending data")
+            self._canvas.itemconfig(self._title_id, text="")
+            return
+
+        movie = self._movies[self._current_idx]
+        self._canvas.itemconfig(self._title_id,
+                                text=movie.get("title", "Unknown").upper())
+
+        backdrop_path = movie.get("backdrop_path")
+        if backdrop_path:
+            photo = ImageLoader.load_backdrop(backdrop_path, (600, 338))
+            if photo:
+                self._backdrop_ref = photo   # prevent GC
+                self._backdrop_label.config(image=photo, text="")
+                return
+        # Fallback if no backdrop available
+        self._backdrop_label.config(image="", text="No backdrop")
+
+    def _navigate(self, direction: int):
+        """Step forward (+1) or backward (-1) through the carousel."""
+        if self._movies:
+            self._current_idx = (self._current_idx + direction) % len(self._movies)
+            self._show_current()
+
+
+
+# 10.  RANDOM PAGE  
+
+class RandomPage(Page):
+    """
+    Shows three randomly-chosen movie posters.  A "Suggest More" button
+    refreshes the selection.  Uses messagebox on network errors.
+    """
+
+    # Horizontal x-positions for the three poster columns
+    _POSTER_X = [150, 370, 590]
+
+    def __init__(self, app: "CinexploreApp"):
+        self._poster_labels: list[tk.Label]              = []
+        self._title_ids:     list[int]                   = []   # canvas item ids
+        self._photo_refs:    list[ImageTk.PhotoImage | None] = [None, None, None]
+        super().__init__(app)
+
+
+    def _build(self):
+        # background 
+        self._bg_photo = ImageLoader.load_local(SEARCH_IMG, (CANVAS_W, WIN_HEIGHT))
+        if self._bg_photo:
+            self._canvas = tk.Canvas(
+                self.frame, width=CANVAS_W, height=WIN_HEIGHT, highlightthickness=0
+            )
+            self._canvas.place(x=0, y=0)
+            self._canvas.create_image(0, 0, image=self._bg_photo, anchor="nw")
+            self._canvas.create_text(
+                95, 75, text="RANDOM MOVIES",
+                font=("Helvetica", 16, "bold"), fill="red", anchor="nw"
+            )
+        else:
+            self.frame.configure(bg="#0a0a0a")
+            self._canvas = tk.Canvas(
+                self.frame, width=CANVAS_W, height=WIN_HEIGHT,
+                highlightthickness=0, bg="#0a0a0a"
+            )
+            self._canvas.place(x=0, y=0)
+
+        # three poster slots
+        for i, x in enumerate(self._POSTER_X):
+            frame = tk.Frame(self.frame, bg="#0a0a0a", bd=0)
+            frame.place(x=x, y=140, width=200, height=300)
+
+            lbl = tk.Label(frame, bg="#111111", text="Loading…", fg="gray")
+            lbl.pack(expand=True, fill="both")
+            self._poster_labels.append(lbl)
+
+            # Title text drawn on the canvas, centred under each poster
+            tid = self._canvas.create_text(
+                x + 100, 460, text="Movie Title",
+                font=("Helvetica", 10, "bold"), fill="white", anchor="center"
+            )
+            self._title_ids.append(tid)
+
+        # "Suggest More" button
+        self._refresh_btn = tk.Button(
+            self.frame, text="Suggest More",
+            font=("Arial", 11, "bold"),
+            bg="white", fg="black", width=11, height=1, bd=3, relief="sunken",
+            activebackground="darkorange", activeforeground="white",
+            command=self._load_random_movies
+        )
+        self._refresh_btn.place(x=470, y=520, anchor="center")
+        self._refresh_btn.bind("<Enter>", lambda e: self._refresh_btn.config(bg="darkorange", fg="white"))
+        self._refresh_btn.bind("<Leave>", lambda e: self._refresh_btn.config(bg="white",      fg="black"))
+
+        # back link
+        self._back_id = self._canvas.create_text(
+            760, 550, text="← Back",
+            font=("Arial", 12, "bold"), fill="white", anchor="nw", tags="back_rand"
+        )
+        self._canvas.tag_bind("back_rand", "<Button-1>", lambda e: self.app.pages["home"].show())
+        self._canvas.tag_bind("back_rand", "<Enter>",   lambda e: self._canvas.itemconfig("back_rand", fill="red"))
+        self._canvas.tag_bind("back_rand", "<Leave>",   lambda e: self._canvas.itemconfig("back_rand", fill="white"))
+
+    # Lifecycle
+    def on_show(self):
+        """Fetch a fresh set of random movies every time the page opens."""
+        self._load_random_movies()
+
+    # Data
+    def _load_random_movies(self):
+        """
+        Pick 3 movies from a random TMDB discover page and display them.
+        Shows a messagebox if the API call fails entirely.
+        """
+        try:
+            movies = TMDBClient.discover()   # random page, no genre filter
+
+            if not movies:
+                # Inform the user via messagebox
+                messagebox.showinfo("No Movies", "No movies were returned. Please try again.")
+                for i in range(3):
+                    self._poster_labels[i].config(image="", text="No movie")
+                    self._canvas.itemconfig(self._title_ids[i], text="—")
+                return
+
+            # Sample up to 3 unique movies from the result list
+            sampled = random.sample(movies, min(3, len(movies)))
+
+            for i, movie in enumerate(sampled):
+                title = movie.get("title", "Unknown")
+                self._canvas.itemconfig(self._title_ids[i], text=title)
+
+                poster_path = movie.get("poster_path")
+                if poster_path:
+                    photo = ImageLoader.load_poster(poster_path, (200, 300))
+                    if photo:
+                        self._poster_labels[i].config(image=photo, text="")
+                        self._photo_refs[i] = photo   # prevent GC
+                        continue                      # skip the fallback below
+                # Fallback – no poster available
+                self._poster_labels[i].config(image="", text="No poster")
+                self._photo_refs[i] = None
+
+        except Exception as exc:
+            # Network / parsing error – show messagebox + update labels
+            messagebox.showerror("Network Error", f"Failed to load movies:\n{str(exc)[:120]}")
+            for i in range(3):
+                self._poster_labels[i].config(image="", text="Error")
+                self._canvas.itemconfig(self._title_ids[i], text="Failed")
+                self._photo_refs[i] = None
+
+
+# 11.  GENRE PAGE  (genre selector + 2×3 poster grid)
+
+class GenrePage(Page):
+    """
+    Left column: clickable genre names.
+    Right area:  a 2×3 grid of posters that update when a genre is clicked.
+    Uses messagebox on network errors.
+    """
+
+    # Poster grid layout – (x, y) top-left corner of each slot
+    _POSTER_POSITIONS = [
+        (270, 100), (470, 100), (670, 100),
+        (270, 320), (470, 320), (670, 320)
+    ]
+
+    def __init__(self, app: "CinexploreApp"):
+        self._poster_labels: list[tk.Label]              = []
+        self._photo_refs:    list[ImageTk.PhotoImage | None] = [None] * 6
+        super().__init__(app)
+
+    def _build(self):
+        # background 
+        self._bg_photo = ImageLoader.load_local(SEARCH_IMG, (CANVAS_W, WIN_HEIGHT))
+        if self._bg_photo:
+            self._canvas = tk.Canvas(
+                self.frame, width=CANVAS_W, height=WIN_HEIGHT, highlightthickness=0
+            )
+            self._canvas.place(x=0, y=0)
+            self._canvas.create_image(0, 0, image=self._bg_photo, anchor="nw")
+            self._canvas.create_text(
+                60, 55, text="GENRES",
+                font=("Helvetica", 18, "bold"), fill="red", anchor="nw"
+            )
+        else:
+            self.frame.configure(bg="#0a0a0a")
+            self._canvas = tk.Canvas(
+                self.frame, width=CANVAS_W, height=WIN_HEIGHT,
+                highlightthickness=0, bg="#0a0a0a"
+            )
+            self._canvas.place(x=0, y=0)
+
+        # clickable genre names (vertical list)
+        start_y  = 140
+        spacing  = 45
+        for i, genre in enumerate(GENRE_TO_ID):
+            tag = f"genre_{i}"
+            self._canvas.create_text(
+                90, start_y + i * spacing,
+                text=genre, font=("Arial", 12, "bold"),
+                fill="white", anchor="nw", tags=tag
+            )
+            # Click → load posters for this genre
+            self._canvas.tag_bind(tag, "<Button-1>", lambda e, g=genre: self._on_genre_click(g))
+            # Hover colour
+            self._canvas.tag_bind(tag, "<Enter>",  lambda e, t=tag: self._canvas.itemconfig(t, fill="red"))
+            self._canvas.tag_bind(tag, "<Leave>",  lambda e, t=tag: self._canvas.itemconfig(t, fill="white"))
+
+        # 2×3 poster grid 
+        for (x, y) in self._POSTER_POSITIONS:
+            frame = tk.Frame(self.frame, bg="#0a0a0a")
+            frame.place(x=x, y=y, width=120, height=190)
+
+            lbl = tk.Label(frame, bg="#111111", text="Loading…", fg="gray")
+            lbl.pack(expand=True, fill="both")
+            self._poster_labels.append(lbl)
+
+        # back link 
+        self._back_id = self._canvas.create_text(
+            780, 550, text="← Back",
+            font=("Arial", 12, "bold"), fill="white", anchor="nw", tags="back_gen"
+        )
+        self._canvas.tag_bind("back_gen", "<Button-1>", lambda e: self.app.pages["home"].show())
+        self._canvas.tag_bind("back_gen", "<Enter>",   lambda e: self._canvas.itemconfig("back_gen", fill="red"))
+        self._canvas.tag_bind("back_gen", "<Leave>",   lambda e: self._canvas.itemconfig("back_gen", fill="white"))
+
+    # Lifecycle
+    def on_show(self):
+        """Load popular (unfiltered) posters the first time the page appears."""
+        self._load_genre_posters()       # no genre → shows popular movies
+
+    # Handlers
+    def _on_genre_click(self, genre_name: str):
+        """Reset poster labels then fetch movies for the chosen genre."""
+        for lbl in self._poster_labels:
+            lbl.config(image="", text="Loading…")
+        self._load_genre_posters(genre_name)
+
+    # Data
+    def _load_genre_posters(self, selected_genre: str | None = None):
+        """
+        Discover movies (optionally filtered) and fill the 2×3 poster grid.
+        Shows a messagebox when the API call fails.
+        """
+        try:
+            # Resolve genre name to its TMDB ID (None if no filter)
+            genre_id = GENRE_TO_ID.get(selected_genre) if selected_genre else None
+            movies   = TMDBClient.discover(genre_id=genre_id, page=random.randint(1, 20))
+
+            if not movies:
+                messagebox.showinfo("No Movies", f'No movies found for "{selected_genre}".')
+                for lbl in self._poster_labels:
+                    lbl.config(image="", text="No movies found")
+                return
+
+            # Pick up to 6 unique movies
+            sampled = random.sample(movies, min(6, len(movies)))
+
+            for i, movie in enumerate(sampled):
+                poster_path = movie.get("poster_path")
+                if poster_path:
+                    photo = ImageLoader.load_poster(poster_path, (120, 190))
+                    if photo:
+                        self._poster_labels[i].config(image=photo, text="")
+                        self._photo_refs[i] = photo
+                        continue
+                # No poster available for this movie
+                self._poster_labels[i].config(image="", text="No poster")
+                self._photo_refs[i] = None
+
+        except Exception as exc:
+            messagebox.showerror("Network Error", f"Failed to load genre movies:\n{str(exc)[:120]}")
+            for lbl in self._poster_labels:
+                lbl.config(image="", text="Error")
+
+
+
+# 12.  ROOT APPLICATION CLASS
+
+class CinexploreApp:
+    """
+    Owns the Tk root window and instantiates every Page subclass.
+
+    This is the single entry-point: create an instance and call run().
+    """
+
+    def __init__(self):
+        # Tk root 
+        self.root = tk.Tk()
+        self.root.title("CINEXPLORE")
+        self.root.geometry(f"{WIN_WIDTH}x{WIN_HEIGHT}")
+        self.root.resizable(False, False)
+
+        #     page container (not strictly needed – each page places itself,
+        #     but kept for clarity) 
+        self._container = tk.Frame(self.root)
+        self._container.pack(fill="both", expand=True)
+
+        # instantiate every page (order matters for initial z-order)
+        self.pages: dict[str, Page] = {}
+        self.pages["intro"]        = IntroPage(self)
+        self.pages["instructions"] = InstructionsPage(self)
+        self.pages["home"]         = HomePage(self)
+        self.pages["search"]       = SearchPage(self)
+        self.pages["trending"]     = TrendingPage(self)
+        self.pages["random"]       = RandomPage(self)
+        self.pages["genres"]       = GenrePage(self)
+
+        # Show the intro (splash) page first
+        self.pages["intro"].show()
+
+    def run(self):
+        """Start the Tkinter main-loop (blocks until the window closes)."""
+        self.root.mainloop()
+
+
+# 13.  ENTRY POINT
+
+if __name__ == "__main__":
+    app = CinexploreApp()
+    app.run()
